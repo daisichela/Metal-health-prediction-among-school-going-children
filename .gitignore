@@ -1,0 +1,19 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.csv
+.Rproj.user/
+
+# Research data
+data/
+raw_data/
+imputed_data/
+
+# Model outputs
+outputs/
+saved_models/
+
+# Secrets
+.env
+.Renviron
