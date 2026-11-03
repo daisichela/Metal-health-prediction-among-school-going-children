@@ -1,11 +1,31 @@
 pacman::p_load(tidyverse, gtsummary, magrittr, labelled, dplyr, mice,
-               glmnet, tidymodels, ranger,xgboost, purrr,tibble, yardstick)
-
-
+               glmnet, tidymodels, ranger,xgboost, purrr,tibble,
+               yardstick, tabpfn)
+##Data Cleaning
+{
 ##Reading in the data
 data <- readRDS("~/PHD work/KIPMAT followup data/KIPMAT follow up/Data/Kipmat_KEMRI/combined_data_full.rds")
 
-names(data)
+  ossdx <- data %>% 
+    dplyr::select(
+      dplyr::contains("ossdx"),
+      dplyr::all_of(c(
+        "study_number",
+        "csex",
+        "cage",
+        "ulemavu",
+        "specify_ulemavu",
+        "kufitika",
+        "relig",
+        "edulev",
+        "occup"
+      ))
+    )
+  
+  write.csv(ossdx, file = "ossdx all.csv")
+
+  
+  add_ossdx<- read.csv("~/PHD work/KIPMAT followup data/Data/UzimaKipmat_DATA_NOHDRS_2026-10-27_1510.csv")
 
 #Visualizing missing data
 visdat::vis_miss(data[,1:30])
@@ -525,14 +545,19 @@ imputed_test_list <- lapply(
  # ~ write.csv(.x, paste0("imputed_mental_health_training_data_", .y, ".csv"), row.names = FALSE)
 #)
 
+}
+
+##Data import and model development
 imputed_train_data<- lapply(1:5, function(i) read.csv(paste0("imputed_mental_health_training_data_", i,".csv"), stringsAsFactors = TRUE))
 
 # Variables to remove
 vars_to_remove <- c(
-  "cbcl_anxious", "cbcl_withdrawn", "cbcl_somatic", "cbcl_social",
-  "cbcl_thought", "cbcl_attention", "cbcl_rule_breaking",
-  "cbcl_aggressive", "cbcl_other", "year"
+   "cbcl_anxious","cbcl_withdrawn",  "cbcl_social",
+  "cbcl_thought", "cbcl_attention","cbcl_somatic", "cbcl_rule_breaking",
+  "cbcl_aggressive", "cbcl_other"
 )
+
+#
 
  imputed_train_data <- lapply(imputed_train_data, function(df){
    df[,!names(df) %in% vars_to_remove, drop= FALSE]
@@ -551,6 +576,7 @@ imputed_test_data <- lapply(imputed_test_data, function(df){
   df[,!names(df) %in% vars_to_remove, drop= FALSE]
 })
 ##Using LASOO regresiion for variable selection
+{
 train_imp1<- read.csv("imputed_mental_health_training_data_1.csv")
 train_imp1$cbcl_total_problems <- scale(train_imp1$cbcl_total_problems)
 
@@ -643,6 +669,7 @@ imputed_test_data <- map(imputed_test_data,
 
 
 names(imputed_train_data[[1]])
+}
 
 #Model development
 
@@ -693,8 +720,8 @@ xgb_mod <- boost_tree(
 run_regression_tuning_split <- function(
     train_data,
     test_data,
-    model_name = c("elastic_net", "rf", "xgb"),
-    outcome = "cbcl_total_problems",
+    model_name = c("lm","elastic_net", "rf", "xgb"),
+    outcome = "cbcl_somatic",
     cv_folds = 5,
     n_bootstrap = 1000,
     ci_level = 0.95) {
@@ -724,26 +751,30 @@ run_regression_tuning_split <- function(
     stop("The outcome contains missing values. Handle these before fitting.")
   }
   
-  outcome_mean <- mean(train_data[[outcome]])
-  outcome_sd   <- sd(train_data[[outcome]])
+  #outcome_mean <- mean(train_data[[outcome]])
+  #outcome_sd   <- sd(train_data[[outcome]])
   
-  if (!is.finite(outcome_sd) || outcome_sd == 0) {
-    stop("The training outcome must have a positive standard deviation.")
-  }
+  #if (!is.finite(outcome_sd) || outcome_sd == 0) {
+  #  stop("The training outcome must have a positive standard deviation.")
+  #}
   
 
   # Scale using training data only
-  train_model <- train_data %>%
-    mutate(
-      cbcl_scaled = (.data[[outcome]] - outcome_mean) / outcome_sd
-    ) %>%
-    select(-all_of(outcome))
+ # train_model <- train_data %>%
+  #  mutate(
+   #   cbcl_scaled = (.data[[outcome]] - outcome_mean) / outcome_sd
+  #  ) %>%
+  #  select(-all_of(outcome))
   
   # Keep the original test outcome for final evaluation
-  test_predictors <- test_data %>%
-    select(-all_of(outcome))
+  #test_predictors <- test_data %>%
+   # select(-all_of(outcome))
+
+
+ 
+  train_model <- train_data 
   
-    
+  test_model <- test_data 
 #Cross validation folds
 
 set.seed(123)
@@ -755,13 +786,19 @@ train_folds <- vfold_cv(
   
 #Preprocessing recipe
 
-recipe_obj <- recipe(cbcl_scaled ~., data = train_model) %>% 
+recipe_obj <- recipe(stats::reformulate(".", response = outcome),
+                                        data = train_model) %>% 
   step_novel(all_nominal_predictors()) %>% 
   step_dummy(all_nominal_predictors())
 
 #Select model and tuning paramaters
 
-if (model_name == "elastic_net") {
+if (model_name == "lm") {
+  
+  mod <- parsnip::linear_reg() %>%
+    parsnip::set_engine("lm")
+  
+} else if (model_name == "elastic_net") {
   mod <- enet_mod
   param_space <- parameters(
     penalty(),
@@ -793,6 +830,67 @@ if (model_name == "elastic_net") {
 workflow_obj <- workflow() %>% 
   add_model(mod) %>% 
   add_recipe (recipe_obj)
+
+regression_metrics <- yardstick::metric_set(
+  yardstick::rmse,
+  yardstick:: mae,
+  yardstick::rsq
+)
+
+if (model_name=="lm") {
+  cv_res <- tune::fit_resamples(
+    workflow_obj,
+    resamples = train_folds,
+    metrics = regression_metrics,
+    control = tune::control_resamples(
+      save_pred = TRUE
+    )
+  )
+  
+  best_params <- NULL
+  
+  final_fit <- workflows::fit(
+    workflow_obj,
+    data = train_model
+  )
+  
+  cv_summary <- tune::collect_metrics(cv_res)
+  
+} else {
+  
+  set.seed(123)
+  
+  tune_res <- tune::tune_bayes(
+    workflow_obj,
+    resamples = train_folds,
+    param_info = param_space,
+    metrics = regression_metrics,
+    initial = 5,
+    iter = 20,
+    control = tune::control_bayes(
+      save_pred = TRUE,
+      verbose = FALSE
+    )
+  )
+  
+  best_params <- tune::select_best(
+    tune_res,
+    metric = "rmse"
+  )
+  
+  final_wf <- tune::finalize_workflow(
+    workflow_obj,
+    best_params
+  )
+  
+  final_fit <- workflows::fit(
+    final_wf,
+    data = train_model
+  )
+  
+  cv_summary <- tune::collect_metrics(tune_res)
+}
+
 
 #Bayesian hyperparameter tuning
 
@@ -831,17 +929,23 @@ final_fit <- fit (
 
 #Predict on the test dataset
 
-pred_scaled <- predict(
+test_predictors <- test_model %>%
+  dplyr::select(-dplyr::all_of(outcome))
+
+pred_original <- predict(
   final_fit,
   new_data = test_predictors
-  )$.pred
+)$.pred
 
-#converting predictors back to original CBCL SCORE UNITS
+test_predictions <- tibble::tibble(
+  truth = test_model[[outcome]],
+  .pred = as.numeric(pred_original)
+)
 
-test_predictions <- tibble(
-  truth = test_data[[outcome]],
-  .pred_scaled = pred_scaled,
-  .pred = pred_scaled * outcome_sd + outcome_mean
+test_metrics <- regression_metrics(
+  test_predictions,
+  truth = truth,
+  estimate = .pred
 )
 
 #Test set regression metrics
@@ -954,9 +1058,7 @@ list(
   test_metrics = test_metrics_with_ci,
   test_predictions = test_predictions,
   bootstrap_metrics = boot_metrics,
-  variable_importance = var_imp_df,
-  outcome_mean = outcome_mean,
-  outcome_sd = outcome_sd
+  variable_importance = var_imp_df
 )
 }
  
@@ -1072,7 +1174,7 @@ results_enet <- lapply(seq_along(imputed_train_data),function(i){
     train_data = imputed_train_data[[i]],
     test_data = imputed_test_data[[i]],
     model_name = "elastic_net",
-    outcome = "cbcl_total_problems"
+    outcome = "cbcl_somatic"
   ) })
 
 
@@ -1082,7 +1184,7 @@ results_rf <- lapply(seq_along(imputed_train_data),function(i){
     train_data = imputed_train_data[[i]],
     test_data = imputed_test_data[[i]],
     model_name = "rf",
-    outcome = "cbcl_total_problems"
+    outcome = "cbcl_somatic"
   ) })
 
 
@@ -1092,7 +1194,7 @@ results_xgb <-lapply(seq_along(imputed_train_data),function(i){
     train_data = imputed_train_data[[i]],
     test_data = imputed_test_data[[i]],
     model_name = "xgb",
-    outcome = "cbcl_total_problems"
+    outcome = "cbcl_somatic"
   ) })
 # Elastic net
 pooled_enet <- pool_prediction_results(results_enet)
@@ -1120,3 +1222,223 @@ results_rf[[1]]$variable_importance
 
 # XGBoost: gain-based importance
 results_xgb[[1]]$variable_importance
+
+##Complete case analysis
+
+train_data <- train_data %>% select(-any_of(vars_to_remove))
+test_data <- test_data %>% select(-any_of(vars_to_remove))
+
+train_data_complete<- train_data %>% drop_na()
+test_data_complete <- test_data %>%  drop_na()
+
+#Model fitting
+results_enet_complete <- run_regression_tuning_split(
+  train_data = train_data_complete,
+  test_data  = test_data_complete,
+  model_name = "elastic_net",
+  outcome    = "cbcl_total_problems"
+)
+results_enet_complete$test_metrics
+
+
+
+###Tabpfn code
+
+nzchar(Sys.getenv("TABPFN_TOKEN"))
+outcome <- "cbcl_total_problems"
+
+predictors <- c(
+  "baby_weight",
+  "gestation",
+  "educlevel",
+  "mother_age",
+  "firstpreg",
+  "npregs" ,
+  "ancattend",
+  "nmalaria",
+  "ntt",
+  "hbfirsttest",
+  "hiv_pregtest",
+  "supspec_iron",
+  "supspec_folicacid",
+  "complhist_pet",
+  "sexn",
+  "multiple",
+  "newb_hr",
+  "apgar5",
+   "vitkgiven" ,
+  "nevirapine" ,
+  "delivemode",
+  "year"
+)
+
+predictors2 <- c("firstpreg",
+                 "ancattend" ,
+                 "nmalaria",
+                 "hbfirsttest",
+                 "complhist_pet",
+                 "sexn" ,
+                 "multiple",
+                 "vitkgiven",
+                 "year")
+run_tabpfn_reg <- function(
+    train_data,
+    test_data,
+    outcome = "cbcl_total_problems",
+    predictors,
+    device = "auto",
+    seed = 123
+){
+  
+  #Preparing predictors and outcomes
+  
+  x_train <- train_data[, predictors, drop=FALSE]
+  x_test <- test_data[, predictors, drop= FALSE]
+  
+  y_train <- train_data[[outcome]]
+  y_test <- test_data[[outcome]]
+  
+  #Fit model
+  
+  fitted_model <- tabpfn::tab_pfn(
+    x_train,
+    y_train,
+    control = tabpfn::control_tab_pfn(
+      device=device,
+      random_state = seed,
+      memory_saving_mode = "auto"
+    )
+  )
+  
+  #predict the held-out test data
+  
+  predictions <- predict(
+    fitted_model,
+    new_data= x_test)
+  
+  test_predictions <- tibble(
+    truth = y_test,
+    .pred = as.numeric(predictions$.pred)
+  )
+   #Evaluate on the original cbcl scale
+  
+  test_metrics <- yardstick::metric_set(
+    yardstick::rmse,
+    yardstick:: mae,
+    yardstick::rsq
+  )(
+    test_predictions,
+    truth = truth,
+    estimate = .pred
+  )
+  list (
+    model_name ="TabPFN",
+    final_fit = fitted_model,
+    test_predictions = test_predictions,
+    test_metrics = test_metrics,
+    n_train = nrow(x_train),
+    n_test = nrow(x_test)
+  )
+}
+
+##Run TabPFN model
+results_tabpfn <- lapply(
+  seq_along(imputed_train_data),
+  function(i){
+    message("Running TabPFN for imputation", i)
+    
+    run_tabpfn_reg(
+      train_data= imputed_train_data[[i]],
+      test_data = imputed_test_data[[i]],
+      outcome = outcome,
+      predictors = predictors2,
+      device ="auto",
+      seed = 123+i
+    )
+  }
+    )
+
+tabpfn_performance <- purrr::map2_dfr(
+  results_tabpfn,
+  seq_along(results_tabpfn),
+  function(res, i) {
+    res$test_metrics |>
+      dplyr::mutate(imputation = i)
+  }
+)
+
+tabpfn_summary <- tabpfn_performance |>
+  dplyr::group_by(.metric) |>
+  dplyr::summarise(
+    mean_estimate = mean(.estimate, na.rm = TRUE),
+    sd_between_imputations = sd(.estimate, na.rm = TRUE),
+    min_estimate = min(.estimate, na.rm = TRUE),
+    max_estimate = max(.estimate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+tabpfn_summary
+
+
+#Logistic regression
+
+model <- lm(cbcl_total_problems~. ,data=imputed_train_data[[1]])
+summary(model)
+
+# Extract coefficients, confidence intervals and p-values
+results <- tidy(model, conf.int = TRUE) %>%
+  mutate(
+    p_adjusted_BH = p.adjust(p.value, method = "BH"),
+    significance = case_when(
+      p_adjusted_BH < 0.001 ~ "***",
+      p_adjusted_BH < 0.01  ~ "**",
+      p_adjusted_BH < 0.05  ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(
+    term, estimate, std.error, statistic,
+    conf.low, conf.high, p.value,
+    p_adjusted_BH, significance
+  )
+
+# Create a formatted table
+results %>%
+  gt() %>%
+  cols_label(
+    term = "Predictor",
+    estimate = "Coefficient",
+    std.error = "Standard error",
+    statistic = "t-statistic",
+    conf.low = "95% CI (lower)",
+    conf.high = "95% CI (upper)",
+    p.value = "Original p-value",
+    p_adjusted_BH = "BH-adjusted p-value",
+    significance = "Significance"
+  ) %>%
+  fmt_number(
+    columns = c(
+      estimate, std.error, statistic,
+      conf.low, conf.high, p.value, p_adjusted_BH
+    ),
+    decimals = 3
+  ) %>%
+  tab_header(
+    title = "Linear regression predicting CBCL total-problems scores",
+    subtitle = "P-values adjusted using the Benjamini–Hochberg procedure"
+  )
+
+
+# Extract coefficient results
+results <- as.data.frame(summary(model)$coefficients)
+
+# Adjust p-values for multiple testing
+results$p_adjusted_BH <- p.adjust(
+  results$`Pr(>|t|)`,
+  method = "BH"
+)
+
+# View results
+results
+tab_model(model)
+
